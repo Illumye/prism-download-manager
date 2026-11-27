@@ -32,3 +32,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 # Encoder only for building test archives.
 lzma-rust2 = { version = "0.22", default-features = false, features = ["std", "xz", "encoder"] }
+
+[lints.rust]
+# Proof harnesses run under Kani (`cargo kani`), which sets this cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

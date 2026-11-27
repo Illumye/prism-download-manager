@@ -562,6 +562,113 @@ impl SegmentTable {
     }
 }
 
+// Proofs for Kani (`cargo kani -p prism-engine`). The harness drives the table the way the
+// workers and the writer do, for every choice of operations, sizes and order up to `STEPS`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    const STEPS: usize = 4;
+    const WORKERS: usize = 2;
+
+    /// Partition, frontiers, progress accounting, and above all crash safety: the durable
+    /// frontier never covers a byte the writer has not written, so a resume never skips one.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn table_invariants_hold() {
+        let total: u64 = kani::any_where(|t| *t > 0 && *t <= 1 << 40);
+        let t = SegmentTable::new(Some(total), SPLIT_ALIGN, true);
+        // Per worker: (segment, cursor) of its assignment.
+        let mut asg: [Option<(usize, u64)>; WORKERS] = [None; WORKERS];
+        // Chunks handed to the writer and not yet written: (segment, offset, len).
+        let mut pending: [Option<(usize, u64, u64)>; STEPS] = [None; STEPS];
+        // What the writer did write to the file, as [from, to) ranges.
+        let mut written_ranges: [(u64, u64); STEPS] = [(0, 0); STEPS];
+        let mut writes = 0;
+
+        for step in 0..STEPS {
+            let w: usize = kani::any_where(|w| *w < WORKERS);
+            let id = w as WorkerId;
+            match kani::any::<u8>() % 5 {
+                0 => {
+                    if asg[w].is_none()
+                        && let Some((a, _)) = t.acquire(id, false)
+                    {
+                        asg[w] = Some((a.seg, a.cursor));
+                    }
+                }
+                1 => {
+                    // A chunk received at the cursor: accounted, then handed to the writer.
+                    if let Some((seg, cursor)) = asg[w] {
+                        let n: u64 = kani::any_where(|n| *n > 0 && *n <= 1 << 24);
+                        let adv = t.advance(seg, id, cursor, n);
+                        if adv.accept > 0 {
+                            pending[step] = Some((seg, cursor, adv.accept));
+                        }
+                        asg[w] = if adv.stop {
+                            None
+                        } else {
+                            Some((seg, cursor + adv.accept))
+                        };
+                    }
+                }
+                2 => {
+                    // The writer writes any pending chunk, in any order.
+                    let k: usize = kani::any_where(|k| *k < STEPS);
+                    if let Some((seg, offset, len)) = pending[k].take() {
+                        written_ranges[writes] = (offset, offset + len);
+                        writes += 1;
+                        t.on_flushed(seg, offset, len);
+                    }
+                }
+                3 => {
+                    if let Some((seg, _)) = asg[w].take() {
+                        t.release(seg, id, kani::any());
+                    }
+                }
+                _ => {
+                    // A race on any segment that could be raced. The real choice depends on
+                    // measured speeds; allowing every candidate covers whatever it picks.
+                    if asg[w].is_none() {
+                        let mut g = t.lock();
+                        let i: usize = kani::any_where(|i| *i < g.segs.len());
+                        let s = &mut g.segs[i];
+                        if s.owner.is_some() && s.racer.is_none() && !s.done() {
+                            s.racer = Some(id);
+                            asg[w] = Some((i, s.pos));
+                        }
+                    }
+                }
+            }
+        }
+
+        let g = t.lock();
+        let mut covered = 0u64;
+        let mut received = 0u64;
+        for (i, s) in g.segs.iter().enumerate() {
+            assert!(s.start <= s.pos && s.pos <= s.end && s.end <= total);
+            assert!(s.start <= s.written && s.written <= s.end);
+            for o in &g.segs[i + 1..] {
+                assert!(s.end <= o.start || o.end <= s.start, "segments overlap");
+            }
+            covered += s.end - s.start;
+            received += s.pos - s.start;
+        }
+        assert_eq!(covered, total, "segments leave a gap");
+        assert_eq!(received, t.downloaded.load(Ordering::Relaxed));
+        // Any byte below a durable frontier was written by the writer.
+        let x: u64 = kani::any();
+        for st in g.segs.iter() {
+            if st.start <= x && x < st.written {
+                assert!(
+                    written_ranges[..writes].iter().any(|(a, b)| *a <= x && x < *b),
+                    "durable frontier covers an unwritten byte"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

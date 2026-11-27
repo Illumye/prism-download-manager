@@ -427,6 +427,58 @@ fn parse_webm(b: &[u8], file_size: Option<u64>) -> Result<MediaIndex, IndexError
     Ok(MediaIndex { init, pieces })
 }
 
+// Proofs for Kani (`cargo kani -p prism-video`): they hold for every input up to the given
+// size, where the fuzz targets only sample. The decoders take raw bytes from the server; the
+// unwind bound covers the longest loop, an 8-byte big-endian read.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// An EBML element header at any position of any 12 bytes: no panic, and a header that
+    /// is returned lies within the input.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn element_header_stays_in_bounds() {
+        let b: [u8; 12] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= 12);
+        let pos: usize = kani::any_where(|p| *p <= 12);
+        if let Ok(Some((_, _, header))) = element(&b[..len], pos) {
+            assert!(pos + header <= len);
+        }
+    }
+
+    /// The children of any 16 bytes of element contents: no panic, and every child's contents
+    /// is a part of the input.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn children_stay_in_bounds() {
+        let d: [u8; 16] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= 16);
+        if let Ok(kids) = children(&d[..len]) {
+            let total: usize = kids.iter().map(|(_, c)| c.len()).sum();
+            assert!(total <= len);
+        }
+    }
+
+    /// Any `sidx` contents up to 44 bytes (two references in v0, one in v1), wherever the box
+    /// ends in the file: no panic, no overflow, and every piece goes forward in the file.
+    /// Its times go forward too, without a proof here: `start` and `end` come from
+    /// `t <= t_end` through a conversion and a division by a positive timescale, both
+    /// correctly rounded in IEEE 754 and therefore monotonic.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn sidx_pieces_go_forward() {
+        let d: [u8; 44] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= 44);
+        let end: u64 = kani::any();
+        if let Ok(pieces) = parse_sidx(&d[..len], end) {
+            for p in &pieces {
+                assert!(p.from <= p.to);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

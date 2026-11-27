@@ -54,3 +54,7 @@ tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 libunftp = { version = "0.23", default-features = false, features = ["ring"] }
 unftp-sbe-fs = "0.4"
+
+[lints.rust]
+# Proof harnesses run under Kani (`cargo kani`), which sets this cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
