@@ -562,92 +562,111 @@ impl SegmentTable {
     }
 }
 
-// Proofs for Kani (`cargo kani -p prism-engine`). The harness drives the table the way the
-// workers and the writer do, for every choice of operations, sizes and order up to `STEPS`.
+// Proofs for Kani (`cargo kani -p prism-engine`). Each harness starts from any valid table and
+// applies one operation: an invariant every operation keeps holds after any number of them, so
+// this covers whole downloads without simulating them.
 #[cfg(kani)]
 mod proofs {
     use super::*;
 
-    const STEPS: usize = 4;
-    const WORKERS: usize = 2;
+    const WORKERS: WorkerId = 2;
+    /// Segments of the starting table; a split adds one.
+    const SEGS: usize = 3;
+    /// `acquire` scans the table and splits: it is checked on a smaller table to stay within
+    /// a laptop's memory. The split itself only depends on the segment it cuts.
+    const ACQUIRE_SEGS: usize = 1;
 
-    /// Partition, frontiers, progress accounting, and above all crash safety: the durable
-    /// frontier never covers a byte the writer has not written, so a resume never skips one.
-    #[kani::proof]
-    #[kani::unwind(7)]
-    fn table_invariants_hold() {
-        let total: u64 = kani::any_where(|t| *t > 0 && *t <= 1 << 40);
-        let t = SegmentTable::new(Some(total), SPLIT_ALIGN, true);
-        // Per worker: (segment, cursor) of its assignment.
-        let mut asg: [Option<(usize, u64)>; WORKERS] = [None; WORKERS];
-        // Chunks handed to the writer and not yet written: (segment, offset, len).
-        let mut pending: [Option<(usize, u64, u64)>; STEPS] = [None; STEPS];
-        // What the writer did write to the file, as [from, to) ranges.
-        let mut written_ranges: [(u64, u64); STEPS] = [(0, 0); STEPS];
-        let mut writes = 0;
+    /// One byte of the file chosen by Kani, and whether the writer has written it. What holds
+    /// for an arbitrary byte holds for all of them.
+    struct Probe {
+        x: u64,
+        written: bool,
+    }
 
-        for step in 0..STEPS {
-            let w: usize = kani::any_where(|w| *w < WORKERS);
-            let id = w as WorkerId;
-            match kani::any::<u8>() % 5 {
-                0 => {
-                    if asg[w].is_none()
-                        && let Some((a, _)) = t.acquire(id, false)
-                    {
-                        asg[w] = Some((a.seg, a.cursor));
-                    }
-                }
-                1 => {
-                    // A chunk received at the cursor: accounted, then handed to the writer.
-                    if let Some((seg, cursor)) = asg[w] {
-                        let n: u64 = kani::any_where(|n| *n > 0 && *n <= 1 << 24);
-                        let adv = t.advance(seg, id, cursor, n);
-                        if adv.accept > 0 {
-                            pending[step] = Some((seg, cursor, adv.accept));
-                        }
-                        asg[w] = if adv.stop {
-                            None
-                        } else {
-                            Some((seg, cursor + adv.accept))
-                        };
-                    }
-                }
-                2 => {
-                    // The writer writes any pending chunk, in any order.
-                    let k: usize = kani::any_where(|k| *k < STEPS);
-                    if let Some((seg, offset, len)) = pending[k].take() {
-                        written_ranges[writes] = (offset, offset + len);
-                        writes += 1;
-                        t.on_flushed(seg, offset, len);
-                    }
-                }
-                3 => {
-                    if let Some((seg, _)) = asg[w].take() {
-                        t.release(seg, id, kani::any());
-                    }
-                }
-                _ => {
-                    // A race on any segment that could be raced. The real choice depends on
-                    // measured speeds; allowing every candidate covers whatever it picks.
-                    if asg[w].is_none() {
-                        let mut g = t.lock();
-                        let i: usize = kani::any_where(|i| *i < g.segs.len());
-                        let s = &mut g.segs[i];
-                        if s.owner.is_some() && s.racer.is_none() && !s.done() {
-                            s.racer = Some(id);
-                            asg[w] = Some((i, s.pos));
-                        }
-                    }
+    impl Probe {
+        fn within(&self, from: u64, to: u64) -> bool {
+            from <= self.x && self.x < to
+        }
+    }
+
+    /// Any table of `K` segments in a valid state, with a probe consistent with it: the
+    /// segments partition `[0, total)`, `start <= written <= pos <= end`, a range flushed
+    /// ahead of `written` lies within `(written, pos]`, a finished segment has no worker, an
+    /// owner never races itself, and every byte below `written` or in that range was written.
+    fn any_valid_table<const K: usize>() -> (SegmentTable, u64, Probe) {
+        // A part file is preallocated before any worker starts, and `fallocate`/`set_len` take
+        // a signed 64-bit size: past `i64::MAX` the download fails first. (Within 4 KiB of
+        // `u64::MAX`, `align_up` would overflow.)
+        let total: u64 = kani::any_where(|t: &u64| *t > 0 && *t <= i64::MAX as u64);
+        let probe = Probe {
+            x: kani::any(),
+            written: kani::any(),
+        };
+        let mut segs = Vec::with_capacity(K + 1);
+        let mut start = 0;
+        let mut downloaded = 0;
+        for i in 0..K {
+            let end = if i + 1 == K {
+                total
+            } else {
+                kani::any_where(|e: &u64| *e > start && *e < total)
+            };
+            let pos = kani::any_where(|p: &u64| *p >= start && *p <= end);
+            let mut seg = Seg::new(start, pos, end);
+            seg.written = kani::any_where(|w: &u64| *w >= start && *w <= pos);
+            if kani::any() {
+                let a = kani::any_where(|a: &u64| *a > seg.written && *a < pos);
+                let b = kani::any_where(|b: &u64| *b > a && *b <= pos);
+                seg.extra = Some((a, b));
+                kani::assume(!probe.within(a, b) || probe.written);
+            }
+            kani::assume(!probe.within(start, seg.written) || probe.written);
+            if !seg.done() && kani::any() {
+                let owner = kani::any_where(|w: &WorkerId| *w < WORKERS);
+                seg.owner = Some(owner);
+                if kani::any() {
+                    seg.racer = Some(kani::any_where(|w: &WorkerId| *w < WORKERS && *w != owner));
                 }
             }
+            // 0, or the end of the owner's request: within the segment when it was set, so at
+            // most the file size even once a split has shrunk the segment.
+            if kani::any() {
+                seg.req_end = kani::any_where(|r: &u64| *r > start && *r <= total);
+            }
+            downloaded += pos - start;
+            segs.push(seg);
+            start = end;
         }
+        let table = SegmentTable {
+            inner: Mutex::new(Inner {
+                segs,
+                total: Some(total),
+                min_split: SPLIT_ALIGN,
+                splittable: true,
+            }),
+            downloaded: AtomicU64::new(downloaded),
+        };
+        (table, total, probe)
+    }
 
+    /// The invariants of `any_valid_table`, plus the progress counter matching the frontiers.
+    fn assert_valid(t: &SegmentTable, total: u64, probe: &Probe) {
         let g = t.lock();
         let mut covered = 0u64;
         let mut received = 0u64;
         for (i, s) in g.segs.iter().enumerate() {
-            assert!(s.start <= s.pos && s.pos <= s.end && s.end <= total);
-            assert!(s.start <= s.written && s.written <= s.end);
+            assert!(s.start <= s.written && s.written <= s.pos && s.pos <= s.end);
+            assert!(s.end <= total);
+            if let Some((a, b)) = s.extra {
+                assert!(s.written < a && a < b && b <= s.pos);
+                assert!(!probe.within(a, b) || probe.written);
+            }
+            assert!(
+                !probe.within(s.start, s.written) || probe.written,
+                "durable frontier covers an unwritten byte"
+            );
+            assert!(!s.done() || (s.owner.is_none() && s.racer.is_none()));
+            assert!(s.racer.is_none() || s.racer != s.owner);
             for o in &g.segs[i + 1..] {
                 assert!(s.end <= o.start || o.end <= s.start, "segments overlap");
             }
@@ -656,16 +675,100 @@ mod proofs {
         }
         assert_eq!(covered, total, "segments leave a gap");
         assert_eq!(received, t.downloaded.load(Ordering::Relaxed));
-        // Any byte below a durable frontier was written by the writer.
-        let x: u64 = kani::any();
-        for st in g.segs.iter() {
-            if st.start <= x && x < st.written {
-                assert!(
-                    written_ranges[..writes].iter().any(|(a, b)| *a <= x && x < *b),
-                    "durable frontier covers an unwritten byte"
-                );
-            }
-        }
+    }
+
+    /// A worker with no assignment in the table.
+    fn idle_worker(t: &SegmentTable) -> WorkerId {
+        let w = kani::any_where(|w: &WorkerId| *w < WORKERS);
+        let g = t.lock();
+        kani::assume(
+            g.segs
+                .iter()
+                .all(|s| s.owner != Some(w) && s.racer != Some(w)),
+        );
+        w
+    }
+
+    /// A segment and one of the workers on it.
+    fn busy_worker(t: &SegmentTable) -> (usize, WorkerId) {
+        let g = t.lock();
+        let seg = kani::any_where(|i: &usize| *i < g.segs.len());
+        let w = kani::any_where(|w: &WorkerId| *w < WORKERS);
+        kani::assume(g.segs[seg].owner == Some(w) || g.segs[seg].racer == Some(w));
+        (seg, w)
+    }
+
+    /// Taking unowned work or splitting a segment.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn acquire_keeps_the_invariants() {
+        let (t, total, probe) = any_valid_table::<ACQUIRE_SEGS>();
+        let w = idle_worker(&t);
+        let got = t.acquire(w, false);
+        kani::cover!(
+            matches!(got, Some((_, AcquireKind::Split { .. }))),
+            "a segment is split"
+        );
+        assert_valid(&t, total, &probe);
+    }
+
+    /// A chunk received at the worker's cursor, which is never past the frontier.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn advance_keeps_the_invariants() {
+        let (t, total, probe) = any_valid_table::<SEGS>();
+        let (seg, w) = busy_worker(&t);
+        let (start, pos, _) = t.bounds(seg);
+        let cursor = kani::any_where(|c: &u64| *c >= start && *c <= pos);
+        let adv = t.advance(seg, w, cursor, kani::any_where(|n: &u64| *n > 0));
+        kani::cover!(
+            adv.progressed > 0 && t.lock().segs[seg].done(),
+            "a segment finishes"
+        );
+        assert_valid(&t, total, &probe);
+    }
+
+    /// The writer reporting a chunk it wrote: any chunk accepted for the segment, in any order.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn flush_keeps_the_invariants() {
+        let (t, total, mut probe) = any_valid_table::<SEGS>();
+        let seg = kani::any_where(|i: &usize| *i < SEGS);
+        let (start, pos, _) = t.bounds(seg);
+        let offset = kani::any_where(|o: &u64| *o >= start && *o < pos);
+        let len = kani::any_where(|l: &u64| *l > 0 && *l <= pos - offset);
+        probe.written |= probe.within(offset, offset + len);
+        let before = t.lock().segs[seg].extra;
+        t.on_flushed(seg, offset, len);
+        let after = t.lock().segs[seg].extra;
+        kani::cover!(
+            before.is_none() && after.is_some(),
+            "a chunk written ahead waits"
+        );
+        kani::cover!(
+            before.is_some() && after.is_none(),
+            "a waiting chunk is merged"
+        );
+        assert_valid(&t, total, &probe);
+    }
+
+    /// A worker giving its assignment back; a racer takes over.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn release_keeps_the_invariants() {
+        let (t, total, probe) = any_valid_table::<SEGS>();
+        let (seg, w) = busy_worker(&t);
+        t.release(seg, w, kani::any());
+        assert_valid(&t, total, &probe);
+    }
+
+    /// The checkpoint a resume starts from never claims a byte the writer has not written.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn resume_starts_from_written_bytes() {
+        let (t, total, probe) = any_valid_table::<SEGS>();
+        let resumed = SegmentTable::from_states(&t.durable_states(), total, SPLIT_ALIGN);
+        assert_valid(&resumed, total, &probe);
     }
 }
 

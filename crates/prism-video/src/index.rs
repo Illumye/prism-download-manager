@@ -460,22 +460,66 @@ mod proofs {
         }
     }
 
-    /// Any `sidx` contents up to 44 bytes (two references in v0, one in v1), wherever the box
-    /// ends in the file: no panic, no overflow, and every piece goes forward in the file.
-    /// Its times go forward too, without a proof here: `start` and `end` come from
-    /// `t <= t_end` through a conversion and a division by a positive timescale, both
-    /// correctly rounded in IEEE 754 and therefore monotonic.
-    #[kani::proof]
-    #[kani::unwind(9)]
-    fn sidx_pieces_go_forward() {
-        let d: [u8; 44] = kani::any();
-        let len: usize = kani::any_where(|l| *l <= 44);
-        let end: u64 = kani::any();
-        if let Ok(pieces) = parse_sidx(&d[..len], end) {
+    /// `sidx` contents of `N` bytes with the given version and reference count, every other
+    /// byte left to Kani. Fixing those two keeps each loop at its real length instead of the
+    /// unwind bound, which is what keeps the float conversions few enough to prove.
+    fn sidx_contents<const N: usize>(version: u8, count: u16) -> [u8; N] {
+        let mut d: [u8; N] = kani::any();
+        d[0] = version;
+        // The count follows the times, the first offset and 2 reserved bytes.
+        let at = if version == 0 { 22 } else { 30 };
+        d[at] = (count >> 8) as u8;
+        d[at + 1] = count as u8;
+        d
+    }
+
+    /// For any times, offsets, sizes and position of the box in the file: no panic, no
+    /// overflow, one piece per reference, and every piece goes forward in the file. Its
+    /// times go forward too: `start` and `end` come from `t <= t_end` through a conversion
+    /// and a division by a positive timescale, both correctly rounded in IEEE 754 and
+    /// therefore monotonic.
+    fn check_sidx<const N: usize>(version: u8, count: u16) {
+        let d: [u8; N] = sidx_contents(version, count);
+        if let Ok(pieces) = parse_sidx(&d, kani::any()) {
+            assert_eq!(pieces.len(), usize::from(count));
             for p in &pieces {
                 assert!(p.from <= p.to);
             }
         }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn sidx_v0_one_reference() {
+        check_sidx::<36>(0, 1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn sidx_v0_two_references() {
+        check_sidx::<48>(0, 2);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn sidx_v1_one_reference() {
+        check_sidx::<44>(1, 1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn sidx_v1_two_references() {
+        check_sidx::<56>(1, 2);
+    }
+
+    /// Anything shorter than one v0 reference never reaches the loop: it is refused, without
+    /// a panic, whatever its bytes.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn sidx_short_contents_are_refused() {
+        let d: [u8; 35] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= 35);
+        assert!(parse_sidx(&d[..len], kani::any()).is_err());
     }
 }
 

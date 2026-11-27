@@ -1,7 +1,7 @@
 name: Kani proofs
 
 # Bounded proofs of the video index decoders and the segment table (`#[cfg(kani)]` harnesses).
-# Each harness gets its own runner: the heavier ones need more memory than a laptop offers.
+# Every harness of a crate runs in one job; each fits in a few GB and takes under two minutes.
 on:
   push:
     branches: [kani-proofs]
@@ -12,17 +12,13 @@ permissions:
 
 jobs:
   proof:
-    name: ${{ matrix.harness }}
+    name: ${{ matrix.crate }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { crate: prism-video, harness: element_header_stays_in_bounds }
-          - { crate: prism-video, harness: children_stay_in_bounds }
-          - { crate: prism-video, harness: sidx_pieces_go_forward }
-          - { crate: prism-engine, harness: table_invariants_hold }
+        crate: [prism-video, prism-engine]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -33,14 +29,12 @@ jobs:
           cargo kani setup
       - name: Prove
         working-directory: crates/${{ matrix.crate }}
-        env:
-          HARNESS: ${{ matrix.harness }}
         run: |
           free -m
           # Peak memory of the whole run (CBMC included) goes to the log, pass or fail.
           set +e
           /usr/bin/time -v -o "$RUNNER_TEMP/time.txt" \
-            timeout 100m cargo kani --lib --harness "$HARNESS"
+            timeout 50m cargo kani --lib
           status=$?
           grep -E 'Elapsed|Maximum resident' "$RUNNER_TEMP/time.txt"
           exit "$status"
